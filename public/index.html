@@ -92,6 +92,8 @@
   }
   .status.active { background: #dcfce7; color: #166534; }
   .status.listening { background: #dbeafe; color: #1e40af; }
+  .status.navigating { background: #fef08a; color: #854d0e; animation: pulseNav 2s infinite; }
+  @keyframes pulseNav { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
 
   /* CAMERA FEED */
   .camera-container {
@@ -110,7 +112,7 @@
     width: 100%;
     height: 100%;
     object-fit: cover;
-    transform: scaleX(-1); /* mirror */
+    /* REMOVED scaleX(-1) so rear camera is not mirrored! */
   }
   .cam-placeholder {
     position: absolute;
@@ -232,7 +234,7 @@
   </div>
 
   <div class="caption" id="captionText">
-    Tap the screen once, then say "Hello HUM" to ask a question.
+    Tap the screen once, then say "Hello HUM" to ask a question or start navigation.
   </div>
 
   <div class="mic-container">
@@ -258,6 +260,10 @@ let isProcessing = false;
 let browserApiKey = null;
 let cameraReady = false;
 
+// Navigation State
+let isNavigating = false;
+let navigationTarget = "";
+
 const video = document.getElementById('video');
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
@@ -265,7 +271,7 @@ const captionText = document.getElementById('captionText');
 const statusBadge = document.getElementById('statusBadge');
 const micBtn = document.getElementById('micBtn');
 
-// --- SYSTEM PROMPT ---
+// --- SYSTEM PROMPTS ---
 const SYSTEM_PROMPT = `You are HUM, an AI vision companion designed specifically for visually impaired and blind users. 
 Your role is to be their eyes.
 Rules:
@@ -273,6 +279,16 @@ Rules:
 - Speak naturally and conversationally.
 - State safety hazards immediately if present.
 - Never mention "I see an image of" or "In the picture". Act as if you are standing right there looking with them.`;
+
+const NAVIGATION_PROMPT = `You are a real-time tracking and navigation assistant guiding a blind person physically.
+CONTEXT: The user's goal is: [TARGET]
+RULES:
+1. Examine the raw camera frame directly in front of them.
+2. Give exactly ONE short, punchy directional command based on the image. Do not explain anything.
+3. Examples of valid commands: 
+   "Pan left", "Pan right", "Scan the room", "Walk forward", "Stop, obstacle ahead", "Turn slightly right", "Target is right in front of you."
+4. If they have clearly reached the target object/place, say "You have reached your destination."
+5. Be concise. Your output must be less than 5 words so they can walk safely in real-time.`;
 
 // --- UI HELPERS ---
 function setStatus(text, stateClass) {
@@ -291,7 +307,7 @@ async function startExperience() {
   const unlockUtterance = new SpeechSynthesisUtterance('');
   window.speechSynthesis.speak(unlockUtterance);
   
-  // 2. Start Camera
+  // 2. Start Camera (rear-facing standard, un-mirrored)
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: 'environment', width: { ideal: 1280 } },
@@ -307,11 +323,14 @@ async function startExperience() {
   // 3. Start Continuous Voice Recognition Loop
   initSpeechRecognition();
   
-  speak("HUM is awake. Say Hello Hum, followed by your question.");
+  speak("HUM is awake. Say Hello Hum, followed by your question or destination.");
 }
 
 // --- SPEECH RECOGNITION (WAKE WORD LOOP) ---
 function initSpeechRecognition() {
+  // If navigating, we don't spin up the strict listener because we are busy taking pictures
+  if(isNavigating) return;
+
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {
     setCaption("Speech recognition not supported in this browser. Please use Chrome.");
@@ -325,7 +344,7 @@ function initSpeechRecognition() {
 
   recognition.onstart = () => {
     isListening = true;
-    if(!isProcessing && !isSpeaking) {
+    if(!isProcessing && !isSpeaking && !isNavigating) {
        setStatus("LISTENING", "listening");
     }
   };
@@ -352,10 +371,16 @@ function initSpeechRecognition() {
       // Extract the command after the wake word if they said it all in one sentence
       let command = transcript.replace(/.*hello h[ua]m/i, '').trim();
       
+      // Handle explicit stop commands if somehow triggered
+      if (['stop', 'cancel', 'end'].includes(command)) {
+         handleStopCommand();
+         return;
+      }
+
       if (command.length > 5) {
         // They asked a question immediately
         setCaption(`"${command}"`);
-        processCommand(command);
+        checkNavIntentAndProcess(command);
       } else {
         // They just said "Hello hum" and paused. 
         speakAndListenForCommand("I'm here, what do you need?");
@@ -365,8 +390,8 @@ function initSpeechRecognition() {
 
   recognition.onend = () => {
     isListening = false;
-    // Auto-restart loop if not actively processing/speaking
-    if (!isProcessing && !isSpeaking) {
+    // Auto-restart loop if not actively processing/speaking/navigating
+    if (!isProcessing && !isSpeaking && !isNavigating) {
       setTimeout(() => {
         try { recognition.start(); } catch(e){}
       }, 500);
@@ -378,6 +403,15 @@ function initSpeechRecognition() {
   };
 
   try { recognition.start(); } catch(e) {}
+}
+
+function handleStopCommand() {
+  if (isNavigating) {
+     isNavigating = false;
+     speak("Navigation stopped.", resetToIdle);
+  } else {
+     speak("Okay.", resetToIdle);
+  }
 }
 
 // If they just say "Hello Hum", we beep/speak and wait for 1 statement
@@ -395,9 +429,14 @@ function speakAndListenForCommand(promptText) {
     };
     
     cmdRec.onresult = (e) => {
-      let finalCommand = e.results[0][0].transcript;
+      let finalCommand = e.results[0][0].transcript.toLowerCase();
       setCaption(`"${finalCommand}"`);
-      processCommand(finalCommand);
+      
+      if (['stop', 'cancel', 'nevermind'].includes(finalCommand.trim())) {
+        handleStopCommand();
+      } else {
+        checkNavIntentAndProcess(finalCommand);
+      }
     };
     
     cmdRec.onerror = () => {
@@ -407,7 +446,7 @@ function speakAndListenForCommand(promptText) {
     };
     
     cmdRec.onend = () => {
-      if(!isProcessing) { // if no result arrived
+      if(!isProcessing && !isNavigating) { // if no result arrived
          micBtn.classList.remove('recording');
          initSpeechRecognition(); 
       }
@@ -417,14 +456,18 @@ function speakAndListenForCommand(promptText) {
   });
 }
 
-// Large Mic Button triggers manual query instantly
+// Large Mic Button triggers manual query instantly (or acts as an emergency stop)
 function manualTrigger() {
-  if (isProcessing || isSpeaking) {
-    // Stop speaking if they tap it while HUM is talking
+  // EMERGENCY STOP capability
+  if (isProcessing || isSpeaking || isNavigating) {
     window.speechSynthesis.cancel();
     isSpeaking = false;
     isProcessing = false;
-    try{ recognition.stop(); }catch(e){}
+    isNavigating = false;
+    micBtn.classList.remove('recording');
+    setCaption("Stopped. Tap mic to restart.");
+    resetToIdle();
+    return;
   }
   
   isProcessing = true;
@@ -439,14 +482,34 @@ function manualTrigger() {
   manualRec.onresult = (e) => {
     let finalCommand = e.results[0][0].transcript;
     setCaption(`"${finalCommand}"`);
-    processCommand(finalCommand);
+    checkNavIntentAndProcess(finalCommand);
   };
   manualRec.onerror = () => { isProcessing = false; micBtn.classList.remove('recording'); initSpeechRecognition(); };
   manualRec.start();
 }
 
 
-// --- CORE LOGIC: FRAME + API CALL ---
+// --- INTENT ROUTING ---
+function checkNavIntentAndProcess(cmd) {
+  const navKeywords = ['guide me', 'head me', 'take me', 'navigate', 'find', 'show me where', 'lead me', 'point me', 'walk me'];
+  let isNavCmd = navKeywords.some(keyword => cmd.toLowerCase().includes(keyword));
+  
+  if (isNavCmd) {
+    isNavigating = true;
+    navigationTarget = cmd;
+    setCaption(`Navigation Mode: ${cmd}`);
+    speak(`Guiding you. Please scan the room slowly.`, () => {
+       // Start the continuous picture-taking loop
+       navigationLoop();
+    });
+  } else {
+    // Normal one-shot command
+    isNavigating = false;
+    processCommand(cmd);
+  }
+}
+
+// --- CORE STANDARD LOGIC
 async function processCommand(userText) {
   setStatus("ANALYZING", "active");
   const frame = captureFrame();
@@ -472,10 +535,7 @@ async function processCommand(userText) {
     });
 
     const data = await res.json();
-    if (!res.ok) {
-      if (res.status === 401 || data.error?.includes('API key')) document.getElementById('apiOverlay').classList.remove('hidden');
-      throw new Error(data.error || 'API Error');
-    }
+    if (!res.ok) throw new Error(data.error || 'API Error');
 
     const reply = data.content[0].text;
     setCaption(reply);
@@ -491,9 +551,61 @@ async function processCommand(userText) {
   }
 }
 
+
+// --- CONTINUOUS NAVIGATION LOGIC ---
+async function navigationLoop() {
+  // Check if user manually hit Stop
+  if (!isNavigating) return;
+  
+  setStatus("NAVIGATING", "navigating");
+  micBtn.classList.add('recording'); // keep mic red to indicate active recording/navigating
+  
+  const frame = captureFrame();
+  const content = [];
+  if (frame) content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: frame } });
+  
+  let currentPrompt = NAVIGATION_PROMPT.replace("[TARGET]", navigationTarget);
+  content.push({ type: 'text', text: "Current view. Give ONE brief direction." });
+
+  try {
+    const res = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(browserApiKey ? { 'x-browser-api-key': browserApiKey } : {}) },
+      body: JSON.stringify({ system: currentPrompt, messages: [{ role: 'user', content }] })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+
+    let reply = data.content[0].text;
+    setCaption(reply); // Show the instruction
+    
+    // Check if arrived / finished
+    let rLow = reply.toLowerCase();
+    if (rLow.includes("reached") || rLow.includes("arrived") || rLow.includes("you are there") || rLow.includes("destination")) {
+       isNavigating = false;
+       speak(reply, resetToIdle);
+    } else {
+       // Speak the direction, then pause slightly, then take the next photo
+       speak(reply, () => {
+         if(isNavigating) {
+           setTimeout(navigationLoop, 500); // Wait half a second before snapping next frame
+         }
+       });
+    }
+
+  } catch (e) {
+    if(isNavigating) {
+      setCaption("Network delay...");
+      setTimeout(navigationLoop, 2000); // If fails, retry in 2 secs instead of crashing
+    }
+  }
+}
+
 function resetToIdle() {
   isProcessing = false;
   isSpeaking = false;
+  isNavigating = false;
   micBtn.classList.remove('recording');
   setStatus("SLEEPING", "");
   setTimeout(() => {
@@ -518,7 +630,7 @@ function speak(text, onCompleteCallback) {
   
   window.speechSynthesis.cancel();
   isSpeaking = true;
-  setStatus("SPEAKING", "active");
+  if (!isNavigating) setStatus("SPEAKING", "active");
   
   const utt = new SpeechSynthesisUtterance(text);
   utt.rate = 1.0;
